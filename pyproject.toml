@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Codex-Stay"
+dynamic = ["version"]
+description = "A disconnect-safe, one-turn runner for the Codex CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "tomli>=2.0; python_version < '3.11'",
+]
+license = { file = "LICENSE" }
+authors = [
+  { name = "Wenbo Wei" },
+]
+keywords = ["codex", "tmux", "cli", "ssh", "terminal"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console :: Curses",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Terminals :: Terminal Emulators/X Terminals",
+]
+
+[project.scripts]
+codexstay = "codex_runner.cli:main"
+
+[tool.hatch.version]
+path = "src/codex_runner/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_runner"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "S", "SIM", "UP"]
+ignore = [
+  # This project intentionally launches exact argv vectors without a shell.
+  "S603",
+  # Constants named "token" identify environment and tmux option names.
+  "S105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = [
+  "E402",
+  "S101",
+  "S106",
+  "S108",
+  "S607",
+  "SIM105",
+  "SIM117",
+]
+
+[tool.mypy]
+strict = true

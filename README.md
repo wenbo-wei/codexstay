@@ -1,4 +1,4 @@
-# Codex-Stay
+# Codex Stay
 
 Keeps an active Codex turn running after terminal or SSH disconnects.
 
@@ -7,7 +7,7 @@ Keeps an active Codex turn running after terminal or SSH disconnects.
 Requires Linux or macOS, Python 3.10+, the Codex CLI, and tmux 3.2+.
 
 ```bash
-uv tool install git+https://github.com/wenbo-wei/Codex-Stay.git
+uv tool install git+https://github.com/wenbo-wei/codex-stay.git
 codexstay setup
 ```
 
@@ -23,10 +23,10 @@ codexstay resume
 
 ## Guarantees and limits
 
-A turn already running under Codex-Stay survives a terminal or SSH client
+A turn already running under Codex Stay survives a terminal or SSH client
 disconnect.
 
-Codex-Stay does not guarantee task success. Authentication or network errors,
+Codex Stay does not guarantee task success. Authentication or network errors,
 approval prompts, and requests for user input may pause or end a turn. A host
 reboot or power loss ends it.
 

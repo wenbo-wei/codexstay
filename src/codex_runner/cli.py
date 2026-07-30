@@ -216,7 +216,7 @@ def print_help() -> None:
         f"""\
 Usage:
   {COMMAND_NAME}          start a new disconnect-safe Codex turn
-  {COMMAND_NAME} resume   search and resume a Codex turn
+  {COMMAND_NAME} resume   search for and resume a Codex thread
 
 Maintenance:
   {COMMAND_NAME} setup [--force]   install the dedicated Codex profile

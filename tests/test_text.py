@@ -42,12 +42,12 @@ class TerminalTextTests(unittest.TestCase):
             title_for(record(title="New Thread", preview="work\nfinished")),
             "work finished",
         )
-        self.assertEqual(title_for(record()), "Untitled session")
+        self.assertEqual(title_for(record()), "Untitled thread")
 
-    def test_display_truncation_respects_wide_characters(self) -> None:
-        self.assertEqual(display_width("A中B"), 4)
-        self.assertEqual(truncate_display("A中BC", 4), "A中…")
-        self.assertEqual(display_width(truncate_display("A中BC", 4)), 4)
+    def test_display_truncation_respects_fullwidth_latin_characters(self) -> None:
+        self.assertEqual(display_width("AＡB"), 4)
+        self.assertEqual(truncate_display("AＡBC", 4), "AＡ…")
+        self.assertEqual(display_width(truncate_display("AＡBC", 4)), 4)
 
     def test_thread_ids_reject_delimiter_and_terminal_controls(self) -> None:
         self.assertTrue(valid_thread_id("019f0000-1111-7222-8333-444455556666"))

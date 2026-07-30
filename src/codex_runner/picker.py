@@ -81,7 +81,7 @@ def resume_picker(
                     selected_line=row_index == selected,
                 )
             if not visible:
-                add_line(2, "  No matching sessions")
+                add_line(2, "  No matching threads")
             add_line(
                 height - 2,
                 f"{selected + 1 if visible else 0} / {len(visible)}",

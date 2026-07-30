@@ -37,7 +37,7 @@ def title_for(record: ThreadRecord) -> str:
     title = sanitize_terminal_text(record.title)
     if not title or title.casefold() in {"new thread", "new chat"}:
         title = sanitize_terminal_text(record.preview)
-    return title[:200] if title else "Untitled session"
+    return title[:200] if title else "Untitled thread"
 
 
 def character_width(character: str) -> int:

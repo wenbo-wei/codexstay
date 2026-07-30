@@ -13,6 +13,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from codex_runner.context import RunnerContext  # noqa: E402
+from codex_runner.models import SessionLaunch  # noqa: E402
 from codex_runner.tmux_backend import TmuxBackend  # noqa: E402
 
 TMUX = shutil.which("tmux")
@@ -28,25 +30,11 @@ from codex_runner import hooks
 
 
 (
-    session,
-    token,
-    tmux_path,
-    label,
     ready_path,
     release_path,
     completed_path,
     input_path,
 ) = sys.argv[1:]
-
-os.environ.update(
-    {
-        hooks.SESSION_ENV: session,
-        hooks.TOKEN_ENV: token,
-        hooks.TMUX_ENV: tmux_path,
-        hooks.TMUX_LABEL_ENV: label,
-        "CODEX_RUNNER_CLOSE_DELAY_SECONDS": "0",
-    }
-)
 
 Path(ready_path).write_text("ready", encoding="utf-8")
 while not Path(release_path).exists():
@@ -130,19 +118,26 @@ class DisconnectLifecycleTests(unittest.TestCase):
 
         created = self.backend.create_session(
             cwd=str(self.root),
-            command=lambda session, token: [
-                sys.executable,
-                "-c",
-                FAKE_CODEX,
-                session,
-                token,
-                str(TMUX),
-                self.label,
-                str(ready),
-                str(release),
-                str(completed),
-                str(input_path),
-            ],
+            launch=lambda session, token: SessionLaunch(
+                command=[
+                    sys.executable,
+                    "-c",
+                    FAKE_CODEX,
+                    str(ready),
+                    str(release),
+                    str(completed),
+                    str(input_path),
+                ],
+                environment={
+                    **RunnerContext(
+                        session=session,
+                        token=token,
+                        tmux_path=str(TMUX),
+                        label=self.label,
+                    ).to_environment(self.environment),
+                    "CODEX_RUNNER_CLOSE_DELAY_SECONDS": "0",
+                },
+            ),
         )
         self.wait_until(ready.exists)
 

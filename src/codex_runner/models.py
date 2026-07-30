@@ -34,3 +34,9 @@ class RunnerSession:
 class CreatedSession:
     name: str
     token: str
+
+
+@dataclass(frozen=True)
+class SessionLaunch:
+    command: list[str]
+    environment: dict[str, str]

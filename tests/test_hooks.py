@@ -21,6 +21,11 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from codex_runner import hooks, profile  # noqa: E402
+from codex_runner.context import (  # noqa: E402
+    DOWNSTREAM_ENV,
+    TOKEN_ENV,
+    RunnerContext,
+)
 from codex_runner.tmux_backend import (  # noqa: E402
     OWNED_OPTION,
     PANE_OPTION,
@@ -180,16 +185,26 @@ class HookHarness(unittest.TestCase):
         )
         self.log_path.write_text("", encoding="utf-8")
 
-    def environment(self, *, token: str | None = None) -> dict[str, str]:
-        return {
-            hooks.SESSION_ENV: self.SESSION,
-            hooks.TOKEN_ENV: self.TOKEN if token is None else token,
-            hooks.TMUX_ENV: str(self.tmux_path),
-            hooks.TMUX_LABEL_ENV: "codexstay-test",
-            "FAKE_TMUX_STATE": str(self.state_path),
-            "FAKE_TMUX_LOG": str(self.log_path),
-            "CODEX_RUNNER_CLOSE_DELAY_SECONDS": "0",
-        }
+    def environment(
+        self,
+        *,
+        token: str | None = None,
+        downstream: tuple[str, ...] | None = None,
+    ) -> dict[str, str]:
+        environment = RunnerContext(
+            session=self.SESSION,
+            token=self.TOKEN if token is None else token,
+            tmux_path=str(self.tmux_path),
+            label="codexstay-test",
+            downstream_notify=downstream,
+        ).to_environment(
+            {
+                "FAKE_TMUX_STATE": str(self.state_path),
+                "FAKE_TMUX_LOG": str(self.log_path),
+            }
+        )
+        environment["CODEX_RUNNER_CLOSE_DELAY_SECONDS"] = "0"
+        return environment
 
     def state(self) -> dict[str, object]:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -286,9 +301,12 @@ class SessionStartHookTests(HookHarness):
         self.assertEqual(self.session_state()["set_count"], 0)
 
     def test_malformed_token_is_rejected_before_tmux_is_contacted(self) -> None:
+        environment = self.environment()
+        environment[TOKEN_ENV] = "not-a-32-character-hex-token"
+
         result = hooks.main(
             [],
-            environ=self.environment(token="not-a-32-character-hex-token"),
+            environ=environment,
             stdin=self.session_start(),
         )
 
@@ -301,13 +319,7 @@ class CloseWorkerTokenTests(HookHarness):
     def test_wrong_token_cannot_request_exit_or_kill_session(self) -> None:
         wrong_token = "fedcba9876543210fedcba9876543210"
 
-        result = hooks.close_worker(
-            self.SESSION,
-            wrong_token,
-            str(self.tmux_path),
-            "codexstay-test",
-            self.environment(token=wrong_token),
-        )
+        result = hooks.close_worker(self.environment(token=wrong_token))
 
         self.assertEqual(result, 0)
         self.assertTrue(self.session_state()["exists"])
@@ -322,13 +334,7 @@ class CloseWorkerLifecycleTests(HookHarness):
         del state["sessions"][self.SESSION]["options"][PANE_OPTION]
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
-        result = hooks.close_worker(
-            self.SESSION,
-            self.TOKEN,
-            str(self.tmux_path),
-            "codexstay-test",
-            self.environment(),
-        )
+        result = hooks.close_worker(self.environment())
 
         self.assertEqual(result, 0)
         self.assertFalse(self.session_state()["exists"])
@@ -340,13 +346,7 @@ class CloseWorkerLifecycleTests(HookHarness):
         environment = self.environment()
         environment["FAKE_TMUX_EXIT_ON_ENTER"] = "1"
 
-        result = hooks.close_worker(
-            self.SESSION,
-            self.TOKEN,
-            str(self.tmux_path),
-            "codexstay-test",
-            environment,
-        )
+        result = hooks.close_worker(environment)
 
         self.assertEqual(result, 0)
         self.assertFalse(self.session_state()["exists"])
@@ -378,13 +378,7 @@ class CloseWorkerLifecycleTests(HookHarness):
                 side_effect=[0.0, 9.0],
             ),
         ):
-            result = hooks.close_worker(
-                self.SESSION,
-                self.TOKEN,
-                str(self.tmux_path),
-                "codexstay-test",
-                environment,
-            )
+            result = hooks.close_worker(environment)
 
         self.assertEqual(result, 0)
         self.assertFalse(self.session_state()["exists"])
@@ -411,7 +405,8 @@ class NotificationTests(HookHarness):
             return 0
 
     def test_completion_schedules_close_before_forwarding_notification(self) -> None:
-        environment = self.environment()
+        downstream = ("/opt/codex-journal", "notify")
+        environment = self.environment(downstream=downstream)
         environment.update(
             {
                 "TMUX": "/tmp/tmux-1000/default,1,0",
@@ -419,8 +414,6 @@ class NotificationTests(HookHarness):
                 "TMUX_TMPDIR": "/tmp/example",
             }
         )
-        downstream = ["/opt/codex-journal", "notify"]
-        environment[hooks.DOWNSTREAM_ENV] = json.dumps(downstream)
         raw_payload = json.dumps(
             {
                 "type": "agent-turn-complete",
@@ -453,33 +446,23 @@ class NotificationTests(HookHarness):
                 "-m",
                 "codex_runner.hooks",
                 "--close",
-                self.SESSION,
-                self.TOKEN,
-                str(self.tmux_path),
-                "codexstay-test",
             ],
         )
         self.assertEqual(spawned[1][0], [*downstream, raw_payload])
         self.assertTrue(spawned[0][1]["start_new_session"])
         self.assertTrue(spawned[1][1]["start_new_session"])
         downstream_environment = spawned[1][1]["env"]
-        for name in (
-            hooks.DOWNSTREAM_ENV,
-            hooks.SESSION_ENV,
-            hooks.TOKEN_ENV,
-            hooks.TMUX_ENV,
-            hooks.TMUX_LABEL_ENV,
-            "CODEX_RUNNER_CLOSE_DELAY_SECONDS",
-            "TMUX",
-            "TMUX_PANE",
-            "TMUX_TMPDIR",
-        ):
+        self.assertFalse(
+            any(name.startswith("CODEX_RUNNER_") for name in downstream_environment)
+        )
+        for name in ("TMUX", "TMUX_PANE", "TMUX_TMPDIR"):
             self.assertNotIn(name, downstream_environment)
+        close_environment = spawned[0][1]["env"]
+        self.assertIn(TOKEN_ENV, close_environment)
 
     def test_noncompletion_forwards_without_scheduling_close(self) -> None:
-        environment = self.environment()
-        downstream = ["/opt/codex-journal", "notify"]
-        environment[hooks.DOWNSTREAM_ENV] = json.dumps(downstream)
+        downstream = ("/opt/codex-journal", "notify")
+        environment = self.environment(downstream=downstream)
         raw_payload = json.dumps({"type": "approval-requested"})
         spawned: list[list[str]] = []
 
@@ -501,8 +484,7 @@ class NotificationTests(HookHarness):
         self.assertEqual(spawned, [[*downstream, raw_payload]])
 
     def test_hung_downstream_is_terminated_then_killed(self) -> None:
-        environment = self.environment()
-        environment[hooks.DOWNSTREAM_ENV] = json.dumps(["/opt/codex-journal", "notify"])
+        environment = self.environment(downstream=("/opt/codex-journal", "notify"))
         process = mock.Mock(pid=4343)
         process.wait.side_effect = [
             subprocess.TimeoutExpired("notify", 3),
@@ -518,7 +500,10 @@ class NotificationTests(HookHarness):
             ),
             mock.patch.object(hooks.os, "killpg") as killpg,
         ):
-            hooks.forward_notification("{}", environment)
+            hooks.notify_main(
+                json.dumps({"type": "approval-requested"}),
+                environment,
+            )
 
         self.assertEqual(
             process.wait.call_args_list,
@@ -531,6 +516,32 @@ class NotificationTests(HookHarness):
                 mock.call(process.pid, signal.SIGKILL),
             ],
         )
+
+    def test_invalid_context_schedules_nothing_and_forwards_nothing(self) -> None:
+        environment = self.environment(downstream=("/opt/codex-journal", "notify"))
+        environment[TOKEN_ENV] = "malformed"
+
+        with mock.patch.object(hooks.subprocess, "Popen") as popen:
+            result = hooks.notify_main(
+                json.dumps({"type": "agent-turn-complete"}),
+                environment,
+            )
+
+        self.assertEqual(result, 0)
+        popen.assert_not_called()
+
+    def test_malformed_downstream_invalidates_the_context(self) -> None:
+        environment = self.environment()
+        environment[DOWNSTREAM_ENV] = '["/opt/journal", 42]'
+
+        with mock.patch.object(hooks.subprocess, "Popen") as popen:
+            result = hooks.notify_main(
+                json.dumps({"type": "approval-requested"}),
+                environment,
+            )
+
+        self.assertEqual(result, 0)
+        popen.assert_not_called()
 
 
 class ProfileTests(unittest.TestCase):

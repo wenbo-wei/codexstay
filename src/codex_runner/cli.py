@@ -13,6 +13,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 from . import APP_NAME, __version__
 from .codex_adapter import CodexAdapterError, list_threads
+from .context import RunnerContext
+from .models import SessionLaunch
 from .picker import resume_picker
 from .profile import profile_path, write_profile
 from .tmux_backend import SessionAlreadyRunning, TmuxBackend, TmuxError
@@ -54,37 +56,6 @@ def ensure_profile() -> None:
         )
 
 
-def runner_environment(
-    session: str,
-    token: str,
-    tmux_path: str,
-    command_path: str,
-) -> list[str]:
-    values = [
-        f"CODEX_RUNNER_SESSION={session}",
-        f"CODEX_RUNNER_TOKEN={token}",
-        f"CODEX_RUNNER_TMUX={tmux_path}",
-        f"CODEX_RUNNER_TMUX_LABEL={TMUX_LABEL}",
-    ]
-    downstream = configured_notify()
-    if downstream and len(downstream) >= 2:
-        try:
-            same_command = (
-                Path(downstream[0]).resolve() == Path(command_path).resolve()
-                and downstream[1] == "_notify"
-            )
-        except OSError:
-            same_command = False
-        if same_command:
-            downstream = None
-    if downstream:
-        values.append(
-            "CODEX_RUNNER_DOWNSTREAM_NOTIFY="
-            + json.dumps(downstream, separators=(",", ":"))
-        )
-    return values
-
-
 def configured_notify() -> list[str] | None:
     config = profile_path(PROFILE_NAME).with_name("config.toml")
     try:
@@ -113,7 +84,6 @@ def start_protected(
     if not target.is_dir():
         target = Path.cwd()
     target = target.absolute()
-    env_path = executable("env")
     runner_path = (
         str(Path(command_path).resolve())
         if command_path is not None
@@ -136,19 +106,32 @@ def start_protected(
     elif resume_thread_id:
         codex_arguments.extend(["resume", resume_thread_id])
 
+    downstream = configured_notify()
+    if downstream and len(downstream) >= 2:
+        try:
+            same_command = (
+                Path(downstream[0]).resolve() == Path(runner_path).resolve()
+                and downstream[1] == "_notify"
+            )
+        except OSError:
+            same_command = False
+        if same_command:
+            downstream = None
+    downstream_notify = tuple(downstream) if downstream else None
+
     try:
         created = backend.create_session(
             cwd=str(target),
-            command=lambda assigned_session, assigned_token: [
-                env_path,
-                *runner_environment(
-                    assigned_session,
-                    assigned_token,
-                    backend.tmux_path,
-                    runner_path,
-                ),
-                *codex_arguments,
-            ],
+            launch=lambda assigned_session, assigned_token: SessionLaunch(
+                command=list(codex_arguments),
+                environment=RunnerContext(
+                    session=assigned_session,
+                    token=assigned_token,
+                    tmux_path=backend.tmux_path,
+                    label=TMUX_LABEL,
+                    downstream_notify=downstream_notify,
+                ).to_environment(os.environ),
+            ),
             thread_id=resume_thread_id,
         )
     except SessionAlreadyRunning as running:

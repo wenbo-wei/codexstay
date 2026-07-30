@@ -6,11 +6,12 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from . import APP_NAME
-from .models import CreatedSession, RunnerSession, valid_thread_id
+from .context import valid_session_name, valid_tmux_label
+from .models import CreatedSession, RunnerSession, SessionLaunch, valid_thread_id
 
 
 class TmuxError(RuntimeError):
@@ -23,9 +24,8 @@ class SessionAlreadyRunning(TmuxError):
         super().__init__(f"Codex thread is already running in {session}")
 
 
-SESSION_PATTERN = re.compile(r"^job-(?:[0-9a-f]{12}|[0-9a-f]{32})$")
-LABEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 PANE_PATTERN = re.compile(r"^%[0-9]+$")
+PANE_INTERNAL_ENVIRONMENT = frozenset({"TERM", "TMUX", "TMUX_PANE"})
 OWNED_OPTION = "@codex_runner_owned"
 PANE_OPTION = "@codex_runner_pane_id"
 THREAD_OPTION = "@codex_runner_thread_id"
@@ -42,7 +42,7 @@ class TmuxBackend:
         label: str = APP_NAME,
         environ: dict[str, str] | None = None,
     ) -> None:
-        if not LABEL_PATTERN.fullmatch(label):
+        if not valid_tmux_label(label):
             raise ValueError("invalid tmux server label")
         self.tmux_path = str(Path(tmux_path))
         self.label = label
@@ -121,7 +121,7 @@ class TmuxBackend:
                 state,
                 created_at,
             ) = parts
-            if owned != "1" or not SESSION_PATTERN.fullmatch(name):
+            if owned != "1" or not valid_session_name(name):
                 continue
             try:
                 attached_count = int(attached)
@@ -140,7 +140,7 @@ class TmuxBackend:
         return sessions
 
     def has_session(self, session: str) -> bool:
-        if not SESSION_PATTERN.fullmatch(session):
+        if not valid_session_name(session):
             return False
         result = self.run("has-session", "-t", f"={session}")
         if result.returncode == 0:
@@ -151,7 +151,7 @@ class TmuxBackend:
         raise TmuxError(self._message(result, "could not query the tmux session"))
 
     def get_option(self, session: str, option: str) -> str | None:
-        if not SESSION_PATTERN.fullmatch(session):
+        if not valid_session_name(session):
             return None
         result = self.run(
             "show-options",
@@ -173,7 +173,7 @@ class TmuxBackend:
         return result.stdout.rstrip("\n")
 
     def set_option(self, session: str, option: str, value: str) -> None:
-        if not SESSION_PATTERN.fullmatch(session):
+        if not valid_session_name(session):
             raise TmuxError("invalid runner session name")
         result = self.run(
             "set-option",
@@ -188,7 +188,7 @@ class TmuxBackend:
             )
 
     def set_option_once(self, session: str, option: str, value: str) -> bool:
-        if not SESSION_PATTERN.fullmatch(session):
+        if not valid_session_name(session):
             return False
         result = self.run(
             "set-option",
@@ -204,7 +204,7 @@ class TmuxBackend:
         self,
         *,
         cwd: str,
-        command: list[str] | Callable[[str, str], list[str]],
+        launch: SessionLaunch | Callable[[str, str], SessionLaunch],
         thread_id: str | None = None,
     ) -> CreatedSession:
         if thread_id is not None and not valid_thread_id(thread_id):
@@ -214,8 +214,8 @@ class TmuxBackend:
                 for active in self.list_sessions():
                     if active.thread_id == thread_id:
                         raise SessionAlreadyRunning(active.name)
-                return self._create_session(cwd, command, thread_id)
-        return self._create_session(cwd, command, thread_id)
+                return self._create_session(cwd, launch, thread_id)
+        return self._create_session(cwd, launch, thread_id)
 
     @contextmanager
     def _creation_lock(self) -> Iterator[None]:
@@ -251,13 +251,14 @@ class TmuxBackend:
     def _create_session(
         self,
         cwd: str,
-        command: list[str] | Callable[[str, str], list[str]],
+        launch: SessionLaunch | Callable[[str, str], SessionLaunch],
         thread_id: str | None,
     ) -> CreatedSession:
         session = "job-" + secrets.token_hex(16)
         token = secrets.token_hex(16)
         result = self.run(
             "new-session",
+            "-E",
             "-d",
             "-P",
             "-F",
@@ -335,26 +336,87 @@ class TmuxBackend:
                         f"could not set tmux option {TOKEN_OPTION}",
                     )
                 )
-            resolved_command = command(session, token) if callable(command) else command
+            resolved_launch = launch(session, token) if callable(launch) else launch
+            resolved_command = list(resolved_launch.command)
+            resolved_environment = dict(resolved_launch.environment)
             if not resolved_command:
                 raise TmuxError("runner command is empty")
-            result = self.run(
+            self._replace_session_environment(
+                session_id,
+                resolved_environment,
+            )
+            respawn_arguments = [
                 "respawn-pane",
                 "-k",
                 "-t",
                 pane_id,
                 "-c",
                 cwd,
-                *resolved_command,
-            )
+            ]
+            for name, value in sorted(resolved_environment.items()):
+                if name in PANE_INTERNAL_ENVIRONMENT or name == "PWD":
+                    continue
+                respawn_arguments.extend(["-e", f"{name}={value}"])
+            respawn_arguments.extend(["-e", f"PWD={cwd}", *resolved_command])
+            result = self.run(*respawn_arguments)
             if result.returncode:
                 raise TmuxError(
                     self._message(result, "could not start Codex inside tmux")
                 )
-        except Exception:
-            self.run("kill-session", "-t", f"={session}")
+        except BaseException:
+            with suppress(OSError):
+                self.run("kill-session", "-t", f"={session}")
             raise
         return CreatedSession(name=session, token=token)
+
+    def _replace_session_environment(
+        self,
+        session_id: str,
+        environment: dict[str, str],
+    ) -> None:
+        global_names: set[str] = set()
+        # tmux's -h output contains only hidden variables, not the ordinary
+        # global environment, so read both views before constructing removals.
+        for arguments in (
+            ("show-environment", "-g"),
+            ("show-environment", "-gh"),
+        ):
+            result = self.run(*arguments)
+            if result.returncode:
+                raise TmuxError(
+                    self._message(
+                        result,
+                        "could not query the tmux global environment",
+                    )
+                )
+            for line in result.stdout.splitlines():
+                if not line:
+                    continue
+                if "=" in line:
+                    name = line.split("=", 1)[0]
+                elif line.startswith("-"):
+                    name = line[1:]
+                else:
+                    name = line
+                if name:
+                    global_names.add(name)
+
+        stale_names = global_names - environment.keys() - PANE_INTERNAL_ENVIRONMENT
+        for name in sorted(stale_names):
+            result = self.run(
+                "set-environment",
+                "-r",
+                "-t",
+                session_id,
+                name,
+            )
+            if result.returncode:
+                raise TmuxError(
+                    self._message(
+                        result,
+                        f"could not remove stale tmux environment variable {name}",
+                    )
+                )
 
     def owns_session(self, session: str, token: str) -> bool:
         return (
@@ -429,7 +491,7 @@ class TmuxBackend:
         *,
         created_token: str | None = None,
     ) -> None:
-        if not SESSION_PATTERN.fullmatch(session):
+        if not valid_session_name(session):
             raise TmuxError("invalid runner session name")
         current = self.environ.get("TMUX", "")
         if current:

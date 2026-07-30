@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from codex_runner.models import SessionLaunch  # noqa: E402
 from codex_runner.tmux_backend import (  # noqa: E402
     OWNED_OPTION,
     PANE_OPTION,
@@ -125,7 +127,7 @@ except TmuxError as error:
             marker = Path(directory) / "started"
             observed: dict[str, object] = {}
 
-            def final_command(session: str, token: str) -> list[str]:
+            def final_launch(session: str, token: str) -> SessionLaunch:
                 observed["session_exists"] = self.backend.has_session(session)
                 observed["owned"] = self.backend.owns_session(session, token)
                 observed["requested_thread_id"] = self.backend.get_option(
@@ -141,20 +143,23 @@ except TmuxError as error:
                     "#{pane_current_command}",
                 )
                 observed["holder_process"] = pane.stdout.strip()
-                return [
-                    sys.executable,
-                    "-c",
-                    (
-                        "from pathlib import Path; import sys, time; "
-                        "Path(sys.argv[1]).write_text('started'); "
-                        "time.sleep(30)"
-                    ),
-                    str(marker),
-                ]
+                return SessionLaunch(
+                    command=[
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; import sys, time; "
+                            "Path(sys.argv[1]).write_text('started'); "
+                            "time.sleep(30)"
+                        ),
+                        str(marker),
+                    ],
+                    environment=self.environment.copy(),
+                )
 
             created = self.backend.create_session(
                 cwd=directory,
-                command=final_command,
+                launch=final_launch,
                 thread_id="019f0000-test-thread",
             )
 
@@ -210,10 +215,86 @@ except TmuxError as error:
             self.assertEqual(listed[0].name, created.name)
             self.assertEqual(listed[0].thread_id, "019f0000-test-thread")
 
+    def test_new_session_replaces_stale_server_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first_marker = Path(directory) / "first-environment.json"
+            second_marker = Path(directory) / "second-environment.json"
+            probe_command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, os, sys, time; "
+                    "from pathlib import Path; "
+                    "Path(sys.argv[1]).write_text(json.dumps({"
+                    "'probe': os.environ.get('CODEX_STAY_ENV_PROBE'), "
+                    "'stale': os.environ.get('CODEX_STAY_ENV_STALE'), "
+                    "'pwd': os.environ.get('PWD')}), encoding='utf-8'); "
+                    "time.sleep(30)"
+                ),
+            ]
+
+            first_environment = self.environment.copy()
+            first_environment["CODEX_STAY_ENV_PROBE"] = "first"
+            first_environment["CODEX_STAY_ENV_STALE"] = "old"
+            first_backend = TmuxBackend(
+                str(TMUX),
+                label=self.label,
+                environ=first_environment,
+            )
+            first_backend.create_session(
+                cwd=directory,
+                launch=SessionLaunch(
+                    command=[*probe_command, str(first_marker)],
+                    environment=first_environment,
+                ),
+            )
+            self.wait_until(
+                lambda: first_marker.exists() and first_marker.stat().st_size > 0
+            )
+
+            second_environment = self.environment.copy()
+            second_environment["CODEX_STAY_ENV_PROBE"] = "second"
+            second_environment.pop("CODEX_STAY_ENV_STALE", None)
+            second_backend = TmuxBackend(
+                str(TMUX),
+                label=self.label,
+                environ=second_environment,
+            )
+            second_backend.create_session(
+                cwd=directory,
+                launch=SessionLaunch(
+                    command=[*probe_command, str(second_marker)],
+                    environment=second_environment,
+                ),
+            )
+            self.wait_until(
+                lambda: second_marker.exists() and second_marker.stat().st_size > 0
+            )
+
+            self.assertEqual(
+                json.loads(first_marker.read_text(encoding="utf-8")),
+                {
+                    "probe": "first",
+                    "stale": "old",
+                    "pwd": directory,
+                },
+            )
+            self.assertEqual(
+                json.loads(second_marker.read_text(encoding="utf-8")),
+                {
+                    "probe": "second",
+                    "stale": None,
+                    "pwd": directory,
+                },
+            )
+
     def test_wrong_token_cannot_rollback_an_owned_session(self) -> None:
         created = self.backend.create_session(
             cwd=os.getcwd(),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            launch=SessionLaunch(
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                environment=self.environment.copy(),
+            ),
         )
 
         wrong_token = "0" * 32
@@ -228,7 +309,10 @@ except TmuxError as error:
     def test_session_option_uses_an_exact_session_target(self) -> None:
         created = self.backend.create_session(
             cwd=os.getcwd(),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            launch=SessionLaunch(
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                environment=self.environment.copy(),
+            ),
         )
 
         self.backend.set_option(
@@ -247,22 +331,25 @@ except TmuxError as error:
             marker = Path(directory) / "input"
             created = self.backend.create_session(
                 cwd=directory,
-                command=[
-                    sys.executable,
-                    "-c",
-                    (
-                        "from pathlib import Path; import sys, time; "
-                        "Path(sys.argv[1]).write_text(sys.stdin.readline()); "
-                        "time.sleep(30)"
-                    ),
-                    str(marker),
-                ],
+                launch=SessionLaunch(
+                    command=[
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; import sys, time; "
+                            "Path(sys.argv[1]).write_text(sys.stdin.readline()); "
+                            "time.sleep(30)"
+                        ),
+                        str(marker),
+                    ],
+                    environment=self.environment.copy(),
+                ),
             )
 
             self.assertFalse(self.backend.request_exit(created.name, "0" * 32))
             self.assertFalse(marker.exists())
             self.assertTrue(self.backend.request_exit(created.name, created.token))
-            self.wait_until(marker.exists)
+            self.wait_until(lambda: marker.exists() and marker.read_text() == "/exit\n")
             self.assertEqual(marker.read_text(), "/exit\n")
 
     def test_request_exit_follows_the_owned_pane_after_it_moves(self) -> None:
@@ -271,16 +358,19 @@ except TmuxError as error:
             decoy = Path(directory) / "decoy-input"
             created = self.backend.create_session(
                 cwd=directory,
-                command=[
-                    sys.executable,
-                    "-c",
-                    (
-                        "from pathlib import Path; import sys, time; "
-                        "Path(sys.argv[1]).write_text(sys.stdin.readline()); "
-                        "time.sleep(30)"
-                    ),
-                    str(marker),
-                ],
+                launch=SessionLaunch(
+                    command=[
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; import sys, time; "
+                            "Path(sys.argv[1]).write_text(sys.stdin.readline()); "
+                            "time.sleep(30)"
+                        ),
+                        str(marker),
+                    ],
+                    environment=self.environment.copy(),
+                ),
             )
             pane = self.backend.get_option(created.name, PANE_OPTION)
             self.assertIsNotNone(pane)
@@ -318,14 +408,17 @@ except TmuxError as error:
             self.assertNotEqual(window_zero.stdout.strip(), pane)
 
             self.assertTrue(self.backend.request_exit(created.name, created.token))
-            self.wait_until(marker.exists)
+            self.wait_until(lambda: marker.exists() and marker.read_text() == "/exit\n")
             self.assertEqual(marker.read_text(), "/exit\n")
             self.assertFalse(decoy.exists())
 
     def test_kill_is_a_fallback_when_the_pane_ignores_exit(self) -> None:
         created = self.backend.create_session(
             cwd=os.getcwd(),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            launch=SessionLaunch(
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                environment=self.environment.copy(),
+            ),
         )
 
         self.assertTrue(self.backend.request_exit(created.name, created.token))
@@ -337,7 +430,10 @@ except TmuxError as error:
         with self.assertRaisesRegex(TmuxError, "runner command is empty"):
             self.backend.create_session(
                 cwd=os.getcwd(),
-                command=[],
+                launch=SessionLaunch(
+                    command=[],
+                    environment=self.environment.copy(),
+                ),
             )
 
         self.assertEqual(self.backend.list_sessions(), [])
@@ -345,7 +441,10 @@ except TmuxError as error:
     def test_attach_failure_rolls_back_only_a_new_session(self) -> None:
         created = self.backend.create_session(
             cwd=os.getcwd(),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            launch=SessionLaunch(
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                environment=self.environment.copy(),
+            ),
         )
 
         result = self.attach_from_non_tty(created.name, created.token)
@@ -356,7 +455,10 @@ except TmuxError as error:
     def test_attach_failure_preserves_an_existing_session(self) -> None:
         created = self.backend.create_session(
             cwd=os.getcwd(),
-            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            launch=SessionLaunch(
+                command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                environment=self.environment.copy(),
+            ),
         )
 
         result = self.attach_from_non_tty(created.name, None)
@@ -367,7 +469,10 @@ except TmuxError as error:
     def test_immediate_command_exit_is_reported_as_an_attach_error(self) -> None:
         created = self.backend.create_session(
             cwd=os.getcwd(),
-            command=[sys.executable, "-c", "raise SystemExit(7)"],
+            launch=SessionLaunch(
+                command=[sys.executable, "-c", "raise SystemExit(7)"],
+                environment=self.environment.copy(),
+            ),
         )
         self.wait_until(lambda: not self.backend.has_session(created.name))
 
@@ -383,11 +488,14 @@ except TmuxError as error:
             try:
                 return self.backend.create_session(
                     cwd=os.getcwd(),
-                    command=[
-                        sys.executable,
-                        "-c",
-                        "import time; time.sleep(30)",
-                    ],
+                    launch=SessionLaunch(
+                        command=[
+                            sys.executable,
+                            "-c",
+                            "import time; time.sleep(30)",
+                        ],
+                        environment=self.environment.copy(),
+                    ),
                     thread_id=thread_id,
                 )
             except SessionAlreadyRunning as error:
@@ -413,10 +521,13 @@ except TmuxError as error:
 
     def test_resuming_again_never_reuses_a_session_name(self) -> None:
         thread_id = "019f0000-repeated-resume"
-        command = [sys.executable, "-c", "import time; time.sleep(30)"]
+        launch = SessionLaunch(
+            command=[sys.executable, "-c", "import time; time.sleep(30)"],
+            environment=self.environment.copy(),
+        )
         first = self.backend.create_session(
             cwd=os.getcwd(),
-            command=command,
+            launch=launch,
             thread_id=thread_id,
         )
         self.assertTrue(
@@ -425,7 +536,7 @@ except TmuxError as error:
 
         second = self.backend.create_session(
             cwd=os.getcwd(),
-            command=command,
+            launch=launch,
             thread_id=thread_id,
         )
 

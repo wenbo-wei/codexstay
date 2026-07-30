@@ -18,6 +18,7 @@ FAKE_CODEX = r"""#!/usr/bin/env python3
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from pathlib import Path
 mode = os.environ["FAKE_CODEX_MODE"]
 pid_path = Path(os.environ["FAKE_CODEX_PID"])
 exit_path = Path(os.environ["FAKE_CODEX_EXIT"])
+child_pid_path = Path(os.environ["FAKE_CODEX_CHILD_PID"])
 pid_path.write_text(str(os.getpid()), encoding="utf-8")
 
 
@@ -111,6 +113,15 @@ if mode == "oversized_output":
         time.sleep(60)
 
 params = request.get("params", {})
+if mode == "descendant":
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    child_pid_path.write_text(str(child.pid), encoding="utf-8")
+
 if mode == "paginate":
     expected = {
         "archived": False,
@@ -247,6 +258,13 @@ elif mode == "empty":
             "result": {"data": [], "nextCursor": None},
         }
     )
+elif mode == "descendant":
+    emit(
+        {
+            "id": request["id"],
+            "result": {"data": [], "nextCursor": None},
+        }
+    )
 else:
     sys.stderr.write("unknown fake mode\n")
     raise SystemExit(68)
@@ -271,12 +289,14 @@ class AppServerAdapterTests(unittest.TestCase):
     def environment(self, mode: str) -> tuple[dict[str, str], Path, Path]:
         pid_path = self.root / f"{mode}.pid"
         exit_path = self.root / f"{mode}.exit"
+        child_pid_path = self.root / f"{mode}.child.pid"
         environment = os.environ.copy()
         environment.update(
             {
                 "FAKE_CODEX_MODE": mode,
                 "FAKE_CODEX_PID": str(pid_path),
                 "FAKE_CODEX_EXIT": str(exit_path),
+                "FAKE_CODEX_CHILD_PID": str(child_pid_path),
             }
         )
         return environment, pid_path, exit_path
@@ -429,6 +449,36 @@ class AppServerAdapterTests(unittest.TestCase):
         self.assertEqual(records, [])
         self.assertEqual(exit_path.read_text(encoding="utf-8"), "eof")
         self.assertFalse(self.process_exists(pid))
+
+    def test_close_reaps_descendants_after_the_leader_exits(self) -> None:
+        environment, leader_pid_path, exit_path = self.environment("descendant")
+        child_pid_path = self.root / "descendant.child.pid"
+        leader_pid = None
+        child_pid = None
+        try:
+            records = list_threads(str(self.codex), environ=environment)
+            leader_pid = self.read_pid(leader_pid_path)
+            child_pid = self.read_pid(child_pid_path)
+
+            self.assertEqual(records, [])
+            self.assertEqual(exit_path.read_text(encoding="utf-8"), "eof")
+            self.assertTrue(
+                self.wait_until_reaped(leader_pid),
+                "fake app-server leader remained alive after close",
+            )
+            self.assertTrue(
+                self.wait_until_reaped(child_pid),
+                "fake app-server descendant remained alive after close",
+            )
+        finally:
+            for pid, path in (
+                (child_pid, child_pid_path),
+                (leader_pid, leader_pid_path),
+            ):
+                if pid is None and path.exists():
+                    pid = self.read_pid(path)
+                if pid is not None and self.process_exists(pid):
+                    self.force_reap(pid)
 
     def test_timeout_is_reported_and_the_child_is_reaped(self) -> None:
         environment, pid_path, exit_path = self.environment("timeout")

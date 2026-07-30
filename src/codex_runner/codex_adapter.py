@@ -3,10 +3,10 @@ import math
 import os
 import re
 import selectors
+import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -154,31 +154,85 @@ class AppServerClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    @classmethod
+    def _wait_for_process_group(
+        cls,
+        process: subprocess.Popen[bytes],
+        process_group_id: int,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            with suppress(Exception):
+                process.poll()
+            if not cls._process_group_exists(process_group_id):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+
+    @staticmethod
+    def _signal_process_group(process_group_id: int, signal_number: int) -> None:
+        with suppress(OSError):
+            os.killpg(process_group_id, signal_number)
+
     def close(self) -> None:
         process = self.process
         selector = self.selector
+        self.selector = None
         if selector is not None:
-            selector.close()
-            self.selector = None
+            with suppress(Exception):
+                selector.close()
         if process is None:
             return
-        if process.stdin is not None:
-            with suppress(OSError):
-                process.stdin.close()
+        process_group_id = process.pid
         try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
+            if process.stdin is not None:
+                with suppress(Exception):
+                    process.stdin.close()
+            with suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1)
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                with suppress(OSError):
-                    stream.close()
-        self.process = None
+
+            if self._process_group_exists(process_group_id):
+                self._signal_process_group(process_group_id, signal.SIGTERM)
+                if not self._wait_for_process_group(
+                    process,
+                    process_group_id,
+                    timeout=1,
+                ):
+                    self._signal_process_group(process_group_id, signal.SIGKILL)
+                    self._wait_for_process_group(
+                        process,
+                        process_group_id,
+                        timeout=1,
+                    )
+        except Exception:
+            self._signal_process_group(process_group_id, signal.SIGKILL)
+            with suppress(Exception):
+                self._wait_for_process_group(
+                    process,
+                    process_group_id,
+                    timeout=1,
+                )
+        finally:
+            with suppress(Exception):
+                process.wait(timeout=0)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    with suppress(Exception):
+                        stream.close()
+            self.process = None
 
     def _send(self, message: dict[str, object]) -> None:
         process = self.process
@@ -395,7 +449,3 @@ def list_threads(
         reverse=True,
     )
     return records
-
-
-def ids(records: Iterable[ThreadRecord]) -> set[str]:
-    return {record.id for record in records}

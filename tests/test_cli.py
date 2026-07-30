@@ -12,7 +12,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from codex_runner import cli  # noqa: E402
 from codex_runner.codex_adapter import CodexAdapterError  # noqa: E402
-from codex_runner.models import CreatedSession  # noqa: E402
+from codex_runner.context import RunnerContext  # noqa: E402
+from codex_runner.models import CreatedSession, SessionLaunch  # noqa: E402
 from codex_runner.tmux_backend import SessionAlreadyRunning  # noqa: E402
 
 
@@ -22,16 +23,16 @@ class TtyBuffer(io.StringIO):
 
 
 class FakeBackend:
-    tmux_path = "/opt/tmux"
+    tmux_path = str(Path(sys.executable).resolve())
 
     def __init__(self) -> None:
-        self.command: list[str] | None = None
+        self.launch: SessionLaunch | None = None
         self.attached: tuple[str, str | None] | None = None
 
     def create_session(self, **kwargs: object) -> CreatedSession:
-        command = kwargs["command"]
-        assert callable(command)
-        self.command = command(
+        launch = kwargs["launch"]
+        assert callable(launch)
+        self.launch = launch(
             "job-123456789abc",
             "0123456789abcdef0123456789abcdef",
         )
@@ -90,7 +91,6 @@ class CommandConstructionTests(unittest.TestCase):
         runner_path = "/opt/bin with spaces/codexstay"
         with (
             tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(cli, "executable", return_value="/usr/bin/env"),
             mock.patch.object(
                 cli,
                 "configured_notify",
@@ -104,14 +104,13 @@ class CommandConstructionTests(unittest.TestCase):
                 command_path=runner_path,
             )
 
-        assert backend.command is not None
-        codex_index = backend.command.index("/opt/codex")
+        assert backend.launch is not None
         expected_notify = json.dumps(
             [str(Path(runner_path).resolve()), "_notify"],
             separators=(",", ":"),
         )
         self.assertEqual(
-            backend.command[codex_index:],
+            backend.launch.command,
             [
                 "/opt/codex",
                 "--profile",
@@ -120,10 +119,12 @@ class CommandConstructionTests(unittest.TestCase):
                 f"notify={expected_notify}",
             ],
         )
-        self.assertIn(
-            "CODEX_RUNNER_DOWNSTREAM_NOTIFY="
-            + json.dumps(["/opt/journal", "notify"], separators=(",", ":")),
-            backend.command[:codex_index],
+        context = RunnerContext.from_environment(backend.launch.environment)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(
+            context.downstream_notify,
+            ("/opt/journal", "notify"),
         )
         self.assertEqual(
             backend.attached,
@@ -134,21 +135,27 @@ class CommandConstructionTests(unittest.TestCase):
         )
 
     def test_wrapper_is_never_configured_as_its_own_downstream(self) -> None:
-        with mock.patch.object(
-            cli,
-            "configured_notify",
-            return_value=["/opt/codexstay", "_notify"],
+        backend = FakeBackend()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(
+                cli,
+                "configured_notify",
+                return_value=["/opt/codexstay", "_notify"],
+            ),
         ):
-            values = cli.runner_environment(
-                "job-123456789abc",
-                "0" * 32,
-                "/opt/tmux",
-                "/opt/codexstay",
+            cli.start_protected(
+                backend,
+                codex_path="/opt/codex",
+                cwd=directory,
+                command_path="/opt/codexstay",
             )
 
-        self.assertFalse(
-            any(value.startswith("CODEX_RUNNER_DOWNSTREAM_NOTIFY=") for value in values)
-        )
+        assert backend.launch is not None
+        context = RunnerContext.from_environment(backend.launch.environment)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIsNone(context.downstream_notify)
 
     def test_app_server_failure_uses_native_picker_inside_protected_tmux(
         self,
@@ -175,10 +182,7 @@ class CommandConstructionTests(unittest.TestCase):
         backend.create_session = mock.Mock(
             side_effect=SessionAlreadyRunning("job-123456789abc")
         )
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(cli, "executable", return_value="/usr/bin/env"),
-        ):
+        with tempfile.TemporaryDirectory() as directory:
             cli.start_protected(
                 backend,
                 codex_path="/opt/codex",
